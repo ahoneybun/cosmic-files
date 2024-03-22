@@ -1,3 +1,9 @@
+cosmic-files (0.1.0ubuntu1) noble; urgency=medium
+
+  * Upgrade to noble and resync with upstream
+
+ -- Aaron Honeycutt <aaron@system76.com>  Fri, 22 Mar 2024 12:40:19 -0600
+
 cosmic-files (0.1.0) jammy; urgency=medium
 
   * Initial release.
