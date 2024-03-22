@@ -12,3 +12,4 @@ jobs:
         with:
           buildpackage-opts: --build=binary --no-sign
           docker-image: ubuntu:devel
+          extra-docker-args: docker network connect multi-host-network container1
