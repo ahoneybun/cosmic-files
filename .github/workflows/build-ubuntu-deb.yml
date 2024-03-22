@@ -12,4 +12,3 @@ jobs:
         with:
           buildpackage-opts: --build=binary --no-sign
           docker-image: ubuntu:devel
-          extra-docker-args: docker network ls
