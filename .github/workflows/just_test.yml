@@ -2,7 +2,7 @@ name: just_test
 on: [pull_request, push]
 jobs:
   ubuntu:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-devel
     steps:
     - run: sudo apt install just
     - uses: actions/checkout@v4
