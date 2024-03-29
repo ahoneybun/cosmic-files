@@ -1,3 +1,9 @@
+cosmic-files (0.1.0ubuntu2) noble; urgency=medium
+
+  * Resync with master
+
+ -- Aaron Honeycutt <aaron@system76.com>  Fri, 29 Mar 2024 11:16:45 -0600
+
 cosmic-files (0.1.0ubuntu1) noble; urgency=medium
 
   * Upgrade to noble and resync with upstream
