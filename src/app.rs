@@ -1,6 +1,8 @@
 // Copyright 2023 System76 <info@system76.com>
 // SPDX-License-Identifier: GPL-3.0-only
 
+use cosmic::iced::clipboard::dnd::DndAction;
+use cosmic::widget::dnd_destination::DragId;
 use cosmic::widget::menu::action::MenuAction;
 use cosmic::widget::menu::key_bind::KeyBind;
 use cosmic::{
@@ -27,6 +29,7 @@ use notify_debouncer_full::{
     notify::{self, RecommendedWatcher, Watcher},
     DebouncedEvent, Debouncer, FileIdMap,
 };
+use slotmap::Key as SlotMapKey;
 use std::{
     any::TypeId,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -35,15 +38,17 @@ use std::{
     path::PathBuf,
     process,
     sync::Arc,
-    time,
+    time::{self, Instant},
 };
 
+use crate::tab::HOVER_DURATION;
 use crate::{
     clipboard::{ClipboardCopy, ClipboardKind, ClipboardPaste},
-    config::{AppTheme, Config, IconSizes, TabConfig, CONFIG_VERSION},
+    config::{AppTheme, Config, Favorite, IconSizes, TabConfig, CONFIG_VERSION},
     fl, home_dir,
     key_bind::key_binds,
     menu, mime_app,
+    mounter::{mounters, MounterItem, MounterItems, MounterKey, Mounters},
     operation::Operation,
     spawn_detached::spawn_detached,
     tab::{self, HeadingOptions, ItemMetadata, Location, Tab},
@@ -117,7 +122,7 @@ impl MenuAction for Action {
             Action::OpenWith => Message::ToggleContextPage(ContextPage::OpenWith),
             Action::Operations => Message::ToggleContextPage(ContextPage::Operations),
             Action::Paste => Message::Paste(entity_opt),
-            Action::Properties => Message::ToggleContextPage(ContextPage::Properties),
+            Action::Properties => Message::ToggleContextPage(ContextPage::Properties(None)),
             Action::Rename => Message::Rename(entity_opt),
             Action::RestoreFromTrash => Message::RestoreFromTrash(entity_opt),
             Action::SelectAll => Message::TabMessage(entity_opt, tab::Message::SelectAll),
@@ -140,6 +145,27 @@ impl MenuAction for Action {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContextItem {
+    NavBar(segmented_button::Entity),
+    TabBar(segmented_button::Entity),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum NavMenuAction {
+    OpenInNewTab(segmented_button::Entity),
+    OpenInNewWindow(segmented_button::Entity),
+    Properties(segmented_button::Entity),
+}
+
+impl MenuAction for NavMenuAction {
+    type Message = cosmic::app::Message<Message>;
+
+    fn message(&self, _entity: Option<Entity>) -> Self::Message {
+        cosmic::app::Message::App(Message::NavMenuAction(*self))
+    }
+}
+
 /// Messages that are used specifically by our [`App`].
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -155,6 +181,10 @@ pub enum Message {
     LaunchUrl(String),
     Modifiers(Modifiers),
     MoveToTrash(Option<Entity>),
+    MounterItems(MounterKey, MounterItems),
+    NavBarClose(Entity),
+    NavBarContext(Entity),
+    NavMenuAction(NavMenuAction),
     NewItem(Option<Entity>, bool),
     NotifyEvents(Vec<DebouncedEvent>),
     NotifyWatcher(WatcherWrapper),
@@ -180,6 +210,14 @@ pub enum Message {
     ToggleContextPage(ContextPage),
     WindowClose,
     WindowNew,
+    DndHoverLocTimeout(Location),
+    DndHoverTabTimeout(Entity),
+    DndEnterNav(Entity),
+    DndExitNav,
+    DndEnterTab(Entity),
+    DndExitTab,
+    DndDropTab(Entity, Option<ClipboardPaste>, DndAction),
+    DndDropNav(Entity, Option<ClipboardPaste>, DndAction),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,7 +225,7 @@ pub enum ContextPage {
     About,
     OpenWith,
     Operations,
-    Properties,
+    Properties(Option<ContextItem>),
     Settings,
 }
 
@@ -197,7 +235,7 @@ impl ContextPage {
             Self::About => String::new(),
             Self::OpenWith => fl!("open-with"),
             Self::Operations => fl!("operations"),
-            Self::Properties => fl!("properties"),
+            Self::Properties(..) => fl!("properties"),
             Self::Settings => fl!("settings"),
         }
     }
@@ -218,6 +256,8 @@ pub enum DialogPage {
         dir: bool,
     },
 }
+
+pub struct MounterData(MounterKey, MounterItem);
 
 pub struct WatcherWrapper {
     watcher_opt: Option<Debouncer<RecommendedWatcher, FileIdMap>>,
@@ -244,6 +284,7 @@ impl PartialEq for WatcherWrapper {
 /// The [`App`] stores application-specific state.
 pub struct App {
     core: Core,
+    nav_bar_context_id: segmented_button::Entity,
     nav_model: segmented_button::SingleSelectModel,
     tab_model: segmented_button::Model<segmented_button::SingleSelect>,
     config_handler: Option<cosmic_config::Config>,
@@ -256,11 +297,17 @@ pub struct App {
     dialog_text_input: widget::Id,
     key_binds: HashMap<KeyBind, Action>,
     modifiers: Modifiers,
+    mounters: Mounters,
+    mounter_items: HashMap<MounterKey, MounterItems>,
     pending_operation_id: u64,
     pending_operations: BTreeMap<u64, (Operation, f32)>,
     complete_operations: BTreeMap<u64, Operation>,
     failed_operations: BTreeMap<u64, (Operation, String)>,
     watcher_opt: Option<(Debouncer<RecommendedWatcher, FileIdMap>, HashSet<PathBuf>)>,
+    nav_dnd_hover: Option<(Location, Instant)>,
+    tab_dnd_hover: Option<(Entity, Instant)>,
+    nav_drag_id: DragId,
+    tab_drag_id: DragId,
 }
 
 impl App {
@@ -490,9 +537,35 @@ impl App {
         widget::settings::view_column(children).into()
     }
 
-    fn properties(&self) -> Element<Message> {
+    fn properties(&self, entity: Option<ContextItem>) -> Element<Message> {
+        match entity {
+            None => self.tab_properties(self.tab_model.active()),
+
+            Some(ContextItem::TabBar(entity)) => self.tab_properties(entity),
+
+            Some(ContextItem::NavBar(item)) => {
+                let mut children = Vec::new();
+
+                if let Some(location) = self.nav_model.data::<Location>(item) {
+                    if let Location::Path(path) = location {
+                        let parent = path.parent().unwrap_or(path);
+
+                        for item in Location::Path(parent.to_owned()).scan(IconSizes::default()) {
+                            if item.path_opt.as_deref() == Some(path) {
+                                children.push(item.property_view(IconSizes::default()));
+                            }
+                        }
+                    };
+                }
+
+                widget::settings::view_column(children).into()
+            }
+        }
+    }
+
+    fn tab_properties(&self, entity: segmented_button::Entity) -> Element<Message> {
         let mut children = Vec::new();
-        let entity = self.tab_model.active();
+
         if let Some(tab) = self.tab_model.data::<Tab>(entity) {
             if let Some(items) = tab.items_opt() {
                 for item in items.iter() {
@@ -505,6 +578,7 @@ impl App {
                 }
             }
         }
+
         widget::settings::view_column(children).into()
     }
 
@@ -644,6 +718,42 @@ impl Application for App {
         &mut self.core
     }
 
+    fn nav_bar(&self) -> Option<Element<message::Message<Self::Message>>> {
+        if !self.core().nav_bar_active() {
+            return None;
+        }
+
+        let nav_model = self.nav_model()?;
+
+        let mut nav = cosmic::widget::nav_bar(nav_model, |entity| {
+            cosmic::app::Message::Cosmic(cosmic::app::cosmic::Message::NavBar(entity))
+        })
+        .drag_id(self.nav_drag_id)
+        .on_dnd_enter(|entity, _| cosmic::app::Message::App(Message::DndEnterNav(entity)))
+        .on_dnd_leave(|_| cosmic::app::Message::App(Message::DndExitNav))
+        .on_dnd_drop(|entity, data, action| {
+            cosmic::app::Message::App(Message::DndDropNav(entity, data, action))
+        })
+        .on_context(|entity| cosmic::app::Message::App(Message::NavBarContext(entity)))
+        .on_close(|entity| cosmic::app::Message::App(Message::NavBarClose(entity)))
+        .context_menu(self.nav_context_menu(self.nav_bar_context_id))
+        .close_icon(
+            widget::icon::from_name("media-eject-symbolic")
+                .size(16)
+                .icon(),
+        )
+        .into_container();
+
+        if !self.core().is_condensed() {
+            nav = nav.max_width(280);
+        }
+
+        Some(Element::from(
+            // XXX both must be shrink to avoid flex layout from ignoring it
+            nav.width(Length::Shrink).height(Length::Shrink),
+        ))
+    }
+
     /// Creates the application, and optionally emits command on initialize.
     fn init(mut core: Core, flags: Self::Flags) -> (Self, Command<Self::Message>) {
         //TODO: make set_nav_bar_toggle_condensed pub
@@ -652,24 +762,16 @@ impl Application for App {
         let app_themes = vec![fl!("match-desktop"), fl!("dark"), fl!("light")];
 
         let mut nav_model = segmented_button::ModelBuilder::default();
-        if let Some(dir) = dirs::home_dir() {
-            nav_model = nav_model.insert(move |b| {
-                b.text(fl!("home"))
-                    .icon(widget::icon::icon(tab::folder_icon_symbolic(&dir, 16)).size(16))
-                    .data(Location::Path(dir.clone()))
-            });
-        }
-        //TODO: Sort by name?
-        for dir_opt in &[
-            dirs::document_dir(),
-            dirs::download_dir(),
-            dirs::audio_dir(),
-            dirs::picture_dir(),
-            dirs::video_dir(),
-        ] {
-            if let Some(dir) = dir_opt {
-                if let Some(file_name) = dir.file_name().and_then(|x| x.to_str()) {
+        for favorite in flags.config.favorites.iter() {
+            if let Some(dir) = favorite.path_opt() {
+                if matches!(favorite, Favorite::Home) {
                     nav_model = nav_model.insert(move |b| {
+                        b.text(fl!("home"))
+                            .icon(widget::icon::icon(tab::folder_icon_symbolic(&dir, 16)).size(16))
+                            .data(Location::Path(dir.clone()))
+                    });
+                } else if let Some(file_name) = dir.file_name().and_then(|x| x.to_str()) {
+                    nav_model = nav_model.insert(|b| {
                         b.text(file_name.to_string())
                             .icon(widget::icon::icon(tab::folder_icon_symbolic(&dir, 16)).size(16))
                             .data(Location::Path(dir.clone()))
@@ -685,6 +787,7 @@ impl Application for App {
 
         let mut app = App {
             core,
+            nav_bar_context_id: segmented_button::Entity::null(),
             nav_model: nav_model.build(),
             tab_model: segmented_button::ModelBuilder::default().build(),
             config_handler: flags.config_handler,
@@ -697,11 +800,17 @@ impl Application for App {
             dialog_text_input: widget::Id::unique(),
             key_binds: key_binds(),
             modifiers: Modifiers::empty(),
+            mounters: mounters(),
+            mounter_items: HashMap::new(),
             pending_operation_id: 0,
             pending_operations: BTreeMap::new(),
             complete_operations: BTreeMap::new(),
             failed_operations: BTreeMap::new(),
             watcher_opt: None,
+            nav_dnd_hover: None,
+            tab_dnd_hover: None,
+            nav_drag_id: DragId::new(),
+            tab_drag_id: DragId::new(),
         };
 
         let mut commands = Vec::new();
@@ -732,16 +841,44 @@ impl Application for App {
         (app, Command::batch(commands))
     }
 
+    fn nav_context_menu(
+        &self,
+        id: widget::nav_bar::Id,
+    ) -> Option<Vec<widget::menu::Tree<cosmic::app::Message<Self::Message>>>> {
+        Some(cosmic::widget::menu::items(
+            &HashMap::new(),
+            vec![
+                cosmic::widget::menu::Item::Button(
+                    fl!("open-in-new-tab"),
+                    NavMenuAction::OpenInNewTab(id),
+                ),
+                cosmic::widget::menu::Item::Button(
+                    fl!("open-in-new-window"),
+                    NavMenuAction::OpenInNewWindow(id),
+                ),
+                cosmic::widget::menu::Item::Divider,
+                cosmic::widget::menu::Item::Button(
+                    fl!("properties"),
+                    NavMenuAction::Properties(id),
+                ),
+            ],
+        ))
+    }
+
     fn nav_model(&self) -> Option<&segmented_button::SingleSelectModel> {
         Some(&self.nav_model)
     }
 
     fn on_nav_select(&mut self, entity: Entity) -> Command<Self::Message> {
-        let location_opt = self.nav_model.data::<Location>(entity).clone();
-
-        if let Some(location) = location_opt {
+        if let Some(location) = self.nav_model.data::<Location>(entity) {
             let message = Message::TabMessage(None, tab::Message::Location(location.clone()));
             return self.update(message);
+        }
+
+        if let Some(data) = self.nav_model.data::<MounterData>(entity).clone() {
+            if let Some(mounter) = self.mounters.get(&data.0) {
+                return mounter.mount(data.1.clone()).map(|_| message::none());
+            }
         }
 
         Command::none()
@@ -898,6 +1035,46 @@ impl Application for App {
                 let paths = self.selected_paths(entity_opt);
                 if !paths.is_empty() {
                     self.operation(Operation::Delete { paths });
+                }
+            }
+            Message::MounterItems(mounter_key, mounter_items) => {
+                // Insert new items
+                self.mounter_items.insert(mounter_key, mounter_items);
+
+                // Remove any items with mounter data from nav model
+                let entities: Vec<Entity> = self.nav_model.iter().collect();
+                for entity in entities {
+                    if self.nav_model.data::<MounterData>(entity).is_some() {
+                        self.nav_model.remove(entity);
+                    }
+                }
+
+                // Collect all mounter items
+                let mut nav_items = Vec::new();
+                for (key, items) in self.mounter_items.iter() {
+                    for item in items.iter() {
+                        nav_items.push((*key, item));
+                    }
+                }
+                // Sort by name lexically
+                nav_items
+                    .sort_by(|a, b| lexical_sort::natural_lexical_cmp(&a.1.name(), &b.1.name()));
+                // Add items to nav model
+                for (key, item) in nav_items {
+                    let mut entity = self
+                        .nav_model
+                        .insert()
+                        .text(item.name())
+                        .data(MounterData(key, item.clone()));
+                    if let Some(path) = item.path() {
+                        entity = entity.data(Location::Path(path.clone()));
+                    }
+                    if let Some(icon) = item.icon() {
+                        entity = entity.icon(widget::icon::icon(icon).size(16));
+                    }
+                    if item.is_mounted() {
+                        entity = entity.closable();
+                    }
                 }
             }
             Message::NewItem(entity_opt, dir) => {
@@ -1063,7 +1240,8 @@ impl Application for App {
                     }
                 }
             }
-            Message::PasteContents(to, contents) => {
+            Message::PasteContents(to, mut contents) => {
+                contents.paths.retain(|p| p != &to);
                 if !contents.paths.is_empty() {
                     match contents.kind {
                         ClipboardKind::Copy => {
@@ -1300,6 +1478,26 @@ impl Application for App {
                         tab::Command::Scroll(id, offset) => {
                             commands.push(scrollable::scroll_to(id, offset));
                         }
+                        tab::Command::DropFiles(to, from) => {
+                            commands.push(self.update(Message::PasteContents(to, from)));
+                        }
+                        tab::Command::Timeout(d, tab_msg) => {
+                            commands.push(Command::perform(
+                                async move {
+                                    tokio::time::sleep(d).await;
+                                    tab_msg
+                                },
+                                move |msg| {
+                                    cosmic::app::Message::App(Message::TabMessage(
+                                        Some(entity),
+                                        msg,
+                                    ))
+                                },
+                            ));
+                        }
+                        tab::Command::MoveToTrash(paths) => {
+                            self.operation(Operation::Delete { paths });
+                        }
                     }
                 }
                 return Command::batch(commands);
@@ -1343,6 +1541,157 @@ impl Application for App {
                     log::error!("failed to get current executable path: {}", err);
                 }
             },
+            Message::DndEnterNav(entity) => {
+                if let Some(location) = self.nav_model.data::<Location>(entity) {
+                    self.nav_dnd_hover = Some((location.clone(), Instant::now()));
+                    let location = location.clone();
+                    return Command::perform(tokio::time::sleep(HOVER_DURATION), move |_| {
+                        cosmic::app::Message::App(Message::DndHoverLocTimeout(location))
+                    });
+                }
+            }
+            Message::DndExitNav => {
+                self.nav_dnd_hover = None;
+            }
+            Message::DndDropNav(entity, data, action) => {
+                self.nav_dnd_hover = None;
+                if let Some((location, data)) = self.nav_model.data::<Location>(entity).zip(data) {
+                    let kind = match action {
+                        DndAction::Move => ClipboardKind::Cut,
+                        _ => ClipboardKind::Copy,
+                    };
+                    let ret = match location {
+                        Location::Path(p) => self.update(Message::PasteContents(
+                            p.clone(),
+                            ClipboardPaste {
+                                kind,
+                                paths: data.paths,
+                            },
+                        )),
+                        Location::Trash if matches!(action, DndAction::Move) => {
+                            self.operation(Operation::Delete { paths: data.paths });
+                            Command::none()
+                        }
+                        _ => {
+                            log::warn!("Copy to trash is not supported.");
+                            Command::none()
+                        }
+                    };
+                    return ret;
+                }
+            }
+            Message::DndHoverLocTimeout(location) => {
+                if self
+                    .nav_dnd_hover
+                    .as_ref()
+                    .is_some_and(|(loc, i)| *loc == location && i.elapsed() >= HOVER_DURATION)
+                {
+                    self.nav_dnd_hover = None;
+                    let entity = self.tab_model.active();
+                    let title = location.to_string();
+                    self.tab_model.text_set(entity, title);
+                    return Command::batch([
+                        self.update_title(),
+                        self.update_watcher(),
+                        self.rescan_tab(entity, location),
+                    ]);
+                }
+            }
+            Message::DndEnterTab(entity) => {
+                self.tab_dnd_hover = Some((entity, Instant::now()));
+                return Command::perform(tokio::time::sleep(HOVER_DURATION), move |_| {
+                    cosmic::app::Message::App(Message::DndHoverTabTimeout(entity))
+                });
+            }
+            Message::DndExitTab => {
+                self.nav_dnd_hover = None;
+            }
+            Message::DndDropTab(entity, data, action) => {
+                self.nav_dnd_hover = None;
+                if let Some((tab, data)) = self.tab_model.data::<Tab>(entity).zip(data) {
+                    let kind = match action {
+                        DndAction::Move => ClipboardKind::Cut,
+                        _ => ClipboardKind::Copy,
+                    };
+                    let ret = match &tab.location {
+                        Location::Path(p) => self.update(Message::PasteContents(
+                            p.clone(),
+                            ClipboardPaste {
+                                kind,
+                                paths: data.paths,
+                            },
+                        )),
+                        Location::Trash if matches!(action, DndAction::Move) => {
+                            self.operation(Operation::Delete { paths: data.paths });
+                            Command::none()
+                        }
+                        _ => {
+                            log::warn!("Copy to trash is not supported.");
+                            Command::none()
+                        }
+                    };
+                    return ret;
+                }
+            }
+            Message::DndHoverTabTimeout(entity) => {
+                if self
+                    .tab_dnd_hover
+                    .as_ref()
+                    .is_some_and(|(e, i)| *e == entity && i.elapsed() >= HOVER_DURATION)
+                {
+                    self.tab_dnd_hover = None;
+                    return self.update(Message::TabActivate(entity));
+                }
+            }
+
+            Message::NavBarClose(entity) => {
+                if let Some(data) = self.nav_model.data::<MounterData>(entity) {
+                    if let Some(mounter) = self.mounters.get(&data.0) {
+                        return mounter.unmount(data.1.clone()).map(|_| message::none());
+                    }
+                }
+            }
+
+            // Tracks which nav bar item to show a context menu for.
+            Message::NavBarContext(entity) => {
+                self.nav_bar_context_id = entity;
+            }
+
+            // Applies selected nav bar context menu operation.
+            Message::NavMenuAction(action) => match action {
+                NavMenuAction::OpenInNewTab(entity) => {
+                    match self.nav_model.data::<Location>(entity) {
+                        Some(Location::Path(ref path)) => {
+                            return self.open_tab(Location::Path(path.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Open the selected path in a new cosmic-files window.
+                NavMenuAction::OpenInNewWindow(entity) => {
+                    if let Some(&Location::Path(ref path)) = self.nav_model.data::<Location>(entity)
+                    {
+                        match env::current_exe() {
+                            Ok(exe) => match process::Command::new(&exe).arg(path).spawn() {
+                                Ok(_child) => {}
+                                Err(err) => {
+                                    log::error!("failed to execute {:?}: {}", exe, err);
+                                }
+                            },
+                            Err(err) => {
+                                log::error!("failed to get current executable path: {}", err);
+                            }
+                        }
+                    }
+                }
+
+                NavMenuAction::Properties(entity) => {
+                    self.context_page = ContextPage::Properties(Some(ContextItem::NavBar(entity)));
+                    self.core.window.show_context = true;
+                    self.set_context_title(self.context_page.title());
+                }
+            },
         }
 
         Command::none()
@@ -1357,7 +1706,7 @@ impl Application for App {
             ContextPage::About => self.about(),
             ContextPage::OpenWith => self.open_with(),
             ContextPage::Operations => self.operations(),
-            ContextPage::Properties => self.properties(),
+            ContextPage::Properties(entity) => self.properties(entity),
             ContextPage::Settings => self.settings(),
         })
     }
@@ -1553,7 +1902,13 @@ impl Application for App {
                         .button_height(32)
                         .button_spacing(space_xxs)
                         .on_activate(Message::TabActivate)
-                        .on_close(|entity| Message::TabClose(Some(entity))),
+                        .on_close(|entity| Message::TabClose(Some(entity)))
+                        .on_dnd_enter(|entity, _| Message::DndEnterTab(entity))
+                        .on_dnd_leave(|_| Message::DndExitTab)
+                        .on_dnd_drop(|entity, data, action| {
+                            Message::DndDropTab(entity, data, action)
+                        })
+                        .drag_id(self.tab_drag_id),
                 )
                 .style(style::Container::Background)
                 .width(Length::Fill),
@@ -1699,10 +2054,7 @@ impl Application for App {
                         }
                     }
 
-                    //TODO: how to properly kill this task?
-                    loop {
-                        tokio::time::sleep(time::Duration::new(1, 0)).await;
-                    }
+                    std::future::pending().await
                 },
             ),
             subscription::channel(
@@ -1773,6 +2125,15 @@ impl Application for App {
             ),
         ];
 
+        for (key, mounter) in self.mounters.iter() {
+            let key = *key;
+            subscriptions.push(
+                mounter
+                    .subscription()
+                    .map(move |items| Message::MounterItems(key, items)),
+            );
+        }
+
         for (id, (pending_operation, _)) in self.pending_operations.iter() {
             //TODO: use recipe?
             let id = *id;
@@ -1792,9 +2153,7 @@ impl Application for App {
                     }
                 }
 
-                loop {
-                    tokio::time::sleep(time::Duration::new(1, 0)).await;
-                }
+                std::future::pending().await
             }));
         }
 
